@@ -1,13 +1,25 @@
 #!/usr/bin/env python
 
 from __future__ import print_function
+from . import constants
+from . import geolocation
+from . import log
+from .compatability import _decode
+from .filesystem import FileSystem
+from .localstorage import Db
+from .media.base import get_all_subclasses
+from .media.media import Media
+from .result import Result
+
+# Funky new parallelism thing
+from .mediafile import MediaFile
+
 import os
 import re
 import sys
 from datetime import datetime
-
+import threading
 import click
-from send2trash import send2trash
 
 # Verify that external dependencies are present first, so the user gets a
 # more user-friendly error instead of an ImportError traceback.
@@ -15,61 +27,8 @@ from .dependencies import verify_dependencies
 if not verify_dependencies():
     sys.exit(1)
 
-from . import constants
-from . import geolocation
-from . import log
-from .compatability import _decode
-from .filesystem import FileSystem
-from .localstorage import Db
-from .media.base import Base, get_all_subclasses
-from .media.media import Media
-from .media.text import Text
-from .media.audio import Audio
-from .media.photo import Photo
-from .media.video import Video
-from .result import Result
-
-
 FILESYSTEM = FileSystem()
-
-
-def import_file(_file, destination, album_from_folder, trash, allow_duplicates):
-    
-    _file = _decode(_file)
-    destination = _decode(destination)
-
-    """Set file metadata and move it to destination.
-    """
-    if not os.path.exists(_file):
-        log.warn('Could not find %s' % _file)
-        log.all('{"source":"%s", "error_msg":"Could not find %s"}' %
-                  (_file, _file))
-        return
-    # Check if the source, _file, is a child folder within destination
-    elif destination.startswith(os.path.abspath(os.path.dirname(_file))+os.sep):
-        log.all('{"source": "%s", "destination": "%s", "error_msg": "Source cannot be in destination"}' % (
-            _file, destination))
-        return
-
-
-    media = Media.get_class_by_file(_file, get_all_subclasses())
-    if not media:
-        log.warn('Not a supported file (%s)' % _file)
-        log.all('{"source":"%s", "error_msg":"Not a supported file"}' % _file)
-        return
-
-    if album_from_folder:
-        media.set_album_from_folder()
-
-    dest_path = FILESYSTEM.process_file(_file, destination,
-        media, allowDuplicate=allow_duplicates, move=False)
-    if dest_path:
-        log.all('%s -> %s' % (_file, dest_path))
-    if trash:
-        send2trash(_file)
-
-    return dest_path or None
-
+PAR_THREADS = 25
 
 @click.command('import')
 @click.option('--destination', type=click.Path(file_okay=False),
@@ -99,6 +58,7 @@ def _import(destination, source, file, album_from_folder, trash, allow_duplicate
 
     files = set()
     paths = set(paths)
+    sem = threading.Semaphore(PAR_THREADS)
     if source:
         source = _decode(source)
         paths.add(source)
@@ -110,12 +70,32 @@ def _import(destination, source, file, album_from_folder, trash, allow_duplicate
             files.update(FILESYSTEM.get_all_files(path, None))
         else:
             files.add(path)
+    print("All files found!")
 
+    threads = []
     for current_file in files:
-        dest_path = import_file(current_file, destination, album_from_folder,
-                    trash, allow_duplicates)
+        mf = MediaFile(
+            file_path=current_file, filesystem=FILESYSTEM,
+            parameters={
+                'destination': destination,
+                'album_from_folder': album_from_folder,
+                'trash': trash,
+                'allow_duplicates': allow_duplicates
+            },
+            semaphore=sem
+        )
+        sem.acquire()
+        print("Acquired semaphore for {0}".format(current_file))
+        mf.start()
+        threads.append(mf)
+
+    print("All threads created!")
+    for mf in threads:
+        mf.join()
+        dest_path = mf.result
         result.append((current_file, dest_path))
         has_errors = has_errors is True or not dest_path
+    print("All threads joined!")
 
     result.write()
 
@@ -138,7 +118,7 @@ def _generate_db(source, debug):
     if not os.path.isdir(source):
         log.error('Source is not a valid directory %s' % source)
         sys.exit(1)
-        
+
     db = Db()
     db.backup_hash_db()
     db.reset_hash_db()
@@ -147,7 +127,7 @@ def _generate_db(source, debug):
         result.append((current_file, True))
         db.add_hash(db.checksum(current_file), current_file)
         log.progress()
-    
+
     db.update_hash_db()
     log.progress('', True)
     result.write()
@@ -326,7 +306,7 @@ def _update(album, location, time, title, paths, debug):
             result.append((current_file, False))
 
     result.write()
-    
+
     if has_errors:
         sys.exit(1)
 
